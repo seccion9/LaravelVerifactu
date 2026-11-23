@@ -105,16 +105,16 @@ class InvoiceModelTest extends TestCase
         $breakdown->save();
         $breakdown->tax_amount = 21.01;
         $breakdown->save();
-        // Validación del hash calculado y almacenado
+        // Validación del hash calculado y almacenado (formato oficial AEAT: d-m-Y e importes con 2 decimales)
         $hashData = [
             'issuer_tax_id' => $invoice->issuer_tax_id,
             'invoice_number' => $invoice->number,
-            'issue_date' => $invoice->date instanceof \Illuminate\Support\Carbon ? $invoice->date->format('Y-m-d') : $invoice->date,
+            'issue_date' => $invoice->date instanceof \DateTimeInterface ? $invoice->date->format('d-m-Y') : \Carbon\Carbon::parse((string)$invoice->date)->format('d-m-Y'),
             'invoice_type' => $invoice->type instanceof \BackedEnum ? $invoice->type->value : (string)$invoice->type,
-            'total_tax' => (string)$invoice->tax,
-            'total_amount' => (string)$invoice->total,
+            'total_tax' => sprintf('%.2f', (float)$invoice->tax),
+            'total_amount' => sprintf('%.2f', (float)$invoice->total),
             'previous_hash' => '',
-            'generated_at' => $invoice->updated_at->format('c'),
+            'generated_at' => $invoice->issued_at ? $invoice->issued_at->format('c') : $invoice->updated_at->format('c'),
         ];
         $expectedHash = \Squareetlabs\VeriFactu\Helpers\HashHelper::generateInvoiceHash($hashData)['hash'];
         $this->assertEquals($expectedHash, $invoice->hash);

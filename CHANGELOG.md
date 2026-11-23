@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Hash Chaining & Immutability (RD 1007/2023)
+- Encadenamiento automático SHA-256 en el modelo `Invoice` (incluyendo registros *soft-deleted*)
+- Bloqueo de edición de campos fiscales en facturas ya encadenadas o con CSV de la AEAT
+- Métodos de verificación `HashHelper::verifyInvoiceHash()`, `HashHelper::verifyChain()` e `Invoice::isChainValid()`
+- Unificación del cálculo de huella en `AeatClient` usando `HashHelper` y preservando `issued_at`
+- Suite de tests `InvoiceChainingTest` con los casos oficiales AEAT v0.1.2 (1 y 2) y guía en `docs/HASH_CHAINING.md`
+
 #### Core Features (Issue #6 + PR #8)
 - Soporte para dos modos de facturación: VERIFACTU y NO VERIFACTU (Requerimiento)
 - Nuevo parámetro de configuración `verifactu_mode` para alternar entre modos
