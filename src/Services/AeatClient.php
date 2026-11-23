@@ -62,15 +62,17 @@ class AeatClient
         string $ts,
         string $prevHash = ''
     ): string {
-        $raw = 'IDEmisorFactura=' . $issuerVat
-            . '&NumSerieFactura=' . $numSerie
-            . '&FechaExpedicionFactura=' . $fechaExp
-            . '&TipoFactura=' . $tipoFactura
-            . '&CuotaTotal=' . $cuotaTotal
-            . '&ImporteTotal=' . $importeTotal
-            . '&Huella=' . $prevHash
-            . '&FechaHoraHusoGenRegistro=' . $ts;
-        return strtoupper(hash('sha256', $raw));
+        $result = \Squareetlabs\VeriFactu\Helpers\HashHelper::generateInvoiceHash([
+            'issuer_tax_id' => $issuerVat,
+            'invoice_number' => $numSerie,
+            'issue_date' => $fechaExp,
+            'invoice_type' => $tipoFactura,
+            'total_tax' => $cuotaTotal,
+            'total_amount' => $importeTotal,
+            'previous_hash' => $prevHash,
+            'generated_at' => $ts,
+        ]);
+        return $result['hash'];
     }
 
     /**
@@ -101,13 +103,37 @@ class AeatClient
         $issuerName = $issuer['name'] ?? '';
         $issuerVat = $issuer['vat'] ?? '';
 
-        // 2. Preparar datos comunes
-        $ts = \Carbon\Carbon::now('UTC')->format('c');
+        // 2. Preparar datos comunes (preservar issued_at del modelo si existe para garantizar misma huella que en BD)
+        $issuedAt = method_exists($invoice, 'getAttribute') ? $invoice->getAttribute('issued_at') : ($invoice->issued_at ?? null);
+        if ($issuedAt instanceof \DateTimeInterface) {
+            $ts = $issuedAt->format('c');
+        } elseif (is_string($issuedAt) && !empty($issuedAt)) {
+            $ts = \Squareetlabs\VeriFactu\Helpers\DateTimeHelper::formatIso8601($issuedAt);
+        } else {
+            $ts = \Carbon\Carbon::now('UTC')->format('c');
+        }
         $numSerie = (string) $invoice->getInvoiceNumber();
         $fechaExp = $invoice->getIssueDate()->format('d-m-Y');
         $tipoFactura = $invoice->getInvoiceType();
         $cuotaTotal = sprintf('%.2f', (float) $invoice->getTaxAmount());
         $importeTotal = sprintf('%.2f', (float) $invoice->getTotalAmount());
+
+        // Resolver previous para encadenamiento si no se pasa explícitamente pero la factura lo tiene
+        if ($previous === null && method_exists($invoice, 'getPreviousHash') && !empty($invoice->getPreviousHash())) {
+            $prevNumber = method_exists($invoice, 'getAttribute') ? $invoice->getAttribute('previous_invoice_number') : ($invoice->previous_invoice_number ?? null);
+            $prevDate = method_exists($invoice, 'getAttribute') ? $invoice->getAttribute('previous_invoice_date') : ($invoice->previous_invoice_date ?? null);
+            if ($prevNumber) {
+                $formattedPrevDate = $prevDate instanceof \DateTimeInterface
+                    ? $prevDate->format('d-m-Y')
+                    : (!empty($prevDate) ? \Carbon\Carbon::parse((string) $prevDate)->format('d-m-Y') : '');
+                $previous = [
+                    'number' => (string) $prevNumber,
+                    'date' => $formattedPrevDate,
+                    'hash' => $invoice->getPreviousHash(),
+                ];
+            }
+        }
+
         $prevHash = $previous['hash'] ?? $invoice->getPreviousHash() ?? '';
 
         // 3. Generar huella

@@ -24,19 +24,77 @@ class Invoice extends Model implements VeriFactuInvoice
 
     protected static function booted()
     {
-        static::saving(function ($invoice) {
-            // Preparar datos para el hash
-            $hashData = [
-                'issuer_tax_id' => $invoice->issuer_tax_id,
-                'invoice_number' => $invoice->number,
-                'issue_date' => $invoice->date instanceof \Illuminate\Support\Carbon ? $invoice->date->format('Y-m-d') : $invoice->date,
-                'invoice_type' => $invoice->type instanceof \BackedEnum ? $invoice->type->value : (string) $invoice->type,
-                'total_tax' => (string) $invoice->tax,
-                'total_amount' => (string) $invoice->total,
-                'previous_hash' => $invoice->previous_hash ?? '', // Si implementas encadenamiento
-                'generated_at' => now()->format('c'),
+        static::saving(function (Invoice $invoice) {
+            $criticalFields = [
+                'issuer_tax_id',
+                'number',
+                'date',
+                'type',
+                'tax',
+                'total',
+                'previous_invoice_hash',
+                'is_first_invoice',
+                'issued_at',
             ];
-            $hashResult = \Squareetlabs\VeriFactu\Helpers\HashHelper::generateInvoiceHash($hashData);
+
+            // 1. Inmutabilidad fiscal (RD 1007/2023):
+            // Si la factura ya tiene un hash persistido:
+            // - Si no cambian campos fiscales, conservar el hash intacto.
+            // - Si cambian campos fiscales y ya está encadenada o aceptada por AEAT (CSV), bloquear la mutación.
+            $originalHash = $invoice->getOriginal('hash');
+            if ($invoice->exists && !empty($originalHash)) {
+                if (!$invoice->isDirty($criticalFields)) {
+                    return;
+                }
+
+                $hasChainedSuccessor = static::withTrashed()
+                    ->where('previous_invoice_hash', $originalHash)
+                    ->exists();
+
+                if ($hasChainedSuccessor || !empty($invoice->getOriginal('csv'))) {
+                    throw new \DomainException(
+                        'No se pueden modificar los campos fiscales de una factura ya encadenada o registrada en AEAT (RD 1007/2023). Emita una factura rectificativa o subsanación.'
+                    );
+                }
+            }
+
+            // 2. Resolución de la huella anterior (Encadenamiento determinista con bloqueo pesimista)
+            // Incluye soft-deleted (withTrashed) porque una factura emitida jamás desaparece de la cadena fiscal.
+            if (empty($invoice->previous_invoice_hash) && !$invoice->is_first_invoice) {
+                $query = static::withTrashed()
+                    ->where('issuer_tax_id', $invoice->issuer_tax_id)
+                    ->whereNotNull('hash');
+
+                if ($invoice->exists && $invoice->getKey() !== null) {
+                    $query->whereKeyNot($invoice->getKey());
+                }
+
+                $previousInvoice = $query->lockForUpdate()->latest('id')->first();
+
+                if ($previousInvoice) {
+                    $invoice->previous_invoice_number = $previousInvoice->number;
+                    $invoice->previous_invoice_date = $previousInvoice->date;
+                    $invoice->previous_invoice_hash = $previousInvoice->hash;
+                    $invoice->is_first_invoice = false;
+                } else {
+                    $invoice->is_first_invoice = true;
+                    $invoice->previous_invoice_hash = null;
+                    $invoice->previous_invoice_number = null;
+                    $invoice->previous_invoice_date = null;
+                }
+            } elseif ($invoice->is_first_invoice) {
+                $invoice->previous_invoice_hash = null;
+                $invoice->previous_invoice_number = null;
+                $invoice->previous_invoice_date = null;
+            }
+
+            // 3. Marca temporal de generación: preservar issued_at si existe, o fijarlo ahora
+            if (empty($invoice->issued_at)) {
+                $invoice->issued_at = now();
+            }
+
+            // 4. Calcular huella SHA-256 conforme a especificación AEAT (Fecha d-m-Y, importes %.2f)
+            $hashResult = \Squareetlabs\VeriFactu\Helpers\HashHelper::generateInvoiceHash($invoice->buildHashData());
             $invoice->hash = $hashResult['hash'];
         });
     }
@@ -88,6 +146,8 @@ class Invoice extends Model implements VeriFactuInvoice
     protected $casts = [
         'date' => 'date',
         'operation_date' => 'date',
+        'issued_at' => 'datetime',
+        'cancelled_at' => 'datetime',
         'type' => InvoiceType::class,
         'amount' => 'decimal:2',
         'tax' => 'decimal:2',
@@ -159,9 +219,83 @@ class Invoice extends Model implements VeriFactuInvoice
         return $this->recipients;
     }
 
+    public function previousInvoice()
+    {
+        return $this->belongsTo(self::class, 'previous_invoice_hash', 'hash')
+            ->withTrashed();
+    }
+
+    /**
+     * Build canonical AEAT hash input fields for this invoice.
+     *
+     * @return array<string, string>
+     */
+    public function buildHashData(): array
+    {
+        if ($this->date instanceof \DateTimeInterface) {
+            $issueDate = $this->date->format('d-m-Y');
+        } elseif (!empty($this->date)) {
+            $issueDate = Carbon::parse((string) $this->date)->format('d-m-Y');
+        } else {
+            $issueDate = '';
+        }
+
+        if ($this->issued_at instanceof \DateTimeInterface) {
+            $generatedAt = $this->issued_at->format('c');
+        } elseif (is_string($this->issued_at) && !empty($this->issued_at)) {
+            $generatedAt = \Squareetlabs\VeriFactu\Helpers\DateTimeHelper::formatIso8601($this->issued_at);
+        } else {
+            $generatedAt = now()->format('c');
+        }
+
+        $prevHash = $this->previous_invoice_hash ?? $this->previous_hash ?? '';
+
+        return [
+            'issuer_tax_id' => (string) $this->issuer_tax_id,
+            'invoice_number' => (string) $this->number,
+            'issue_date' => $issueDate,
+            'invoice_type' => $this->type instanceof \BackedEnum ? (string) $this->type->value : (string) $this->type,
+            'total_tax' => sprintf('%.2f', (float) $this->tax),
+            'total_amount' => sprintf('%.2f', (float) $this->total),
+            'previous_hash' => (string) $prevHash,
+            'generated_at' => $generatedAt,
+        ];
+    }
+
+    /**
+     * Verify whether both the invoice's own SHA-256 hash and its chain link with the previous invoice are valid.
+     */
+    public function isChainValid(?self $previousInvoice = null): bool
+    {
+        if (empty($this->hash)) {
+            return false;
+        }
+
+        // 1. Verificar integridad criptográfica de la propia factura
+        if (!\Squareetlabs\VeriFactu\Helpers\HashHelper::verifyInvoiceHash($this->hash, $this->buildHashData())) {
+            return false;
+        }
+
+        // 2. Verificar eslabón con el registro anterior
+        if ($this->is_first_invoice) {
+            return empty($this->previous_invoice_hash);
+        }
+
+        if (empty($this->previous_invoice_hash)) {
+            return false;
+        }
+
+        $prev = $previousInvoice ?? $this->previousInvoice()->first();
+        if ($prev) {
+            return \Squareetlabs\VeriFactu\Helpers\HashHelper::verifyChain($prev->hash, $this->previous_invoice_hash);
+        }
+
+        return (bool) preg_match('/^[A-F0-9]{64}$/i', $this->previous_invoice_hash);
+    }
+
     public function getPreviousHash(): ?string
     {
-        return $this->previous_hash ?? null;
+        return $this->previous_invoice_hash ?? $this->previous_hash ?? null;
     }
 
     public function getOperationDescription(): string

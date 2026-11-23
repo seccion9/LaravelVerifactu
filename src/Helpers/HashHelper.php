@@ -54,9 +54,38 @@ class HashHelper
         }
     }
 
-    private static function field(string $name, string $value, bool $includeSeparator = true): string
+    private static function field(string $name, ?string $value, bool $includeSeparator = true): string
     {
-        $value = trim($value);
+        $value = trim($value ?? '');
         return "{$name}={$value}" . ($includeSeparator ? '&' : '');
+    }
+
+    /**
+     * Validates if a calculated hash matches the expected hash.
+     */
+    public static function verifyInvoiceHash(string $expectedHash, array $data): bool
+    {
+        $result = self::generateInvoiceHash($data);
+        return hash_equals(strtoupper(trim($expectedHash)), $result['hash']);
+    }
+
+    /**
+     * Validates if a hash chain between two consecutive invoices is unbroken.
+     *
+     * @param string|null $previousInvoiceHash The actual hash of the previous invoice
+     * @param string|null $currentPreviousHashField The previous_hash field stored in the current invoice
+     * @return bool
+     */
+    public static function verifyChain(?string $previousInvoiceHash, ?string $currentPreviousHashField): bool
+    {
+        if (empty($previousInvoiceHash) && empty($currentPreviousHashField)) {
+            return true; // Primera factura de la serie
+        }
+
+        if (empty($previousInvoiceHash) || empty($currentPreviousHashField)) {
+            return false;
+        }
+
+        return hash_equals(strtoupper(trim($previousInvoiceHash)), strtoupper(trim($currentPreviousHashField)));
     }
 } 
